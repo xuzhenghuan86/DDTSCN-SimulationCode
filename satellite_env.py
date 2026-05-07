@@ -10,13 +10,14 @@ from simulation_core import (
 )
 
 class SatelliteEnv(gym.Env):
-    def __init__(self, task_arrival_rate=200):
+    def __init__(self, task_arrival_rate=200, sim_duration=None):
         super().__init__()
         self.action_space = spaces.Discrete(NUM_SATELLITES)
         # 25 loads + 4 task features = 29
         self.observation_space = spaces.Box(
             low=0, high=1.0, shape=(NUM_SATELLITES + 4,), dtype=np.float32)
         self.task_arrival_rate = task_arrival_rate
+        self.sim_duration = sim_duration if sim_duration else SIM_DURATION_S
         self.reset()
 
     def reset(self, seed=None, options=None):
@@ -33,7 +34,7 @@ class SatelliteEnv(gym.Env):
         return self._obs(), {}
 
     def _advance_until_task(self):
-        while not self.pending and self.current_time_s < SIM_DURATION_S:
+        while not self.pending and self.current_time_s < self.sim_duration:
             for sat in self.satellites:
                 sat.update_position(self.current_time_s)
                 if sat.is_processing and sat.current_task:
@@ -92,5 +93,5 @@ class SatelliteEnv(gym.Env):
             self.current_time_s += TIME_STEP_S
             self._advance_until_task()
 
-        done = self.current_time_s >= SIM_DURATION_S
+        done = self.current_time_s >= self.sim_duration
         return self._obs(), reward, done, False, {}

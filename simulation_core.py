@@ -88,7 +88,15 @@ class Satellite:
         self.is_processing = False
         self.x = 0.0
         self.y = 0.0
+        self.z = 0.0
         self.last_sync_time = 0
+        
+        # Orbital parameters for analytical J2 propagation
+        self.inclination = math.radians(53.0)
+        self.raan_0 = self.orbit_plane * (2 * math.pi / NUM_ORBIT_PLANES)
+        # Walker-Delta phase offset (F=1)
+        phase_offset = self.orbit_plane * (2 * math.pi / NUM_SATELLITES)
+        self.mean_anomaly_0 = self.slot * (2 * math.pi / SATS_PER_PLANE) + phase_offset
 
     def add_task(self, task):
         """Priority queuing: Category-0 tasks are inserted before Category-1."""
@@ -104,10 +112,22 @@ class Satellite:
             self.task_queue.append(task)
 
     def update_position(self, current_time_s):
-        angle = (ORBIT_SPEED_MPS * current_time_s / ORBIT_RADIUS_M) + \
-                (self.slot * 2 * math.pi / SATS_PER_PLANE)
-        self.x = ORBIT_RADIUS_M * math.cos(angle)
-        self.y = ORBIT_RADIUS_M * math.sin(angle)
+        # Analytical SGP4-lite with J2 perturbations
+        R_E = 6371000
+        J2 = 1.08263e-3
+        MU = 3.986004418e14
+        
+        n = math.sqrt(MU / ORBIT_RADIUS_M**3)
+        # J2 nodal precession rate
+        raan_dot = -1.5 * n * J2 * (R_E / ORBIT_RADIUS_M)**2 * math.cos(self.inclination)
+        
+        current_raan = self.raan_0 + raan_dot * current_time_s
+        current_anomaly = self.mean_anomaly_0 + n * current_time_s
+        
+        # 3D position in ECI coordinates
+        self.x = ORBIT_RADIUS_M * (math.cos(current_raan)*math.cos(current_anomaly) - math.sin(current_raan)*math.sin(current_anomaly)*math.cos(self.inclination))
+        self.y = ORBIT_RADIUS_M * (math.sin(current_raan)*math.cos(current_anomaly) + math.cos(current_raan)*math.sin(current_anomaly)*math.cos(self.inclination))
+        self.z = ORBIT_RADIUS_M * (math.sin(current_anomaly)*math.sin(self.inclination))
 
     def get_queue_load(self):
         load = sum(t.cpu_cycles for t in self.task_queue)
@@ -125,18 +145,29 @@ def calculate_delay_s(sat1, sat2, task_size_mb):
     """Calculate propagation + transmission delay between two satellites."""
     if sat1.sat_id == sat2.sat_id:
         return 0.0
-    dist = math.sqrt((sat1.x - sat2.x)**2 + (sat1.y - sat2.y)**2)
+    dist = math.sqrt((sat1.x - sat2.x)**2 + (sat1.y - sat2.y)**2 + (sat1.z - sat2.z)**2)
     dist = min(dist, 2 * ORBIT_RADIUS_M)
     prop_delay = dist / C
     trans_delay = (task_size_mb * 8 * 1e6) / (ISL_BANDWIDTH_MBPS * 1e6) 
     return prop_delay + trans_delay
 
 def is_neighbor(sat1, sat2):
-    """Walker-Delta neighbor: same plane or adjacent plane same slot."""
+    """Walker-Delta neighbor with range and Earth-limb clearance constraints."""
     if sat1.sat_id == sat2.sat_id:
         return True
+        
+    dist = math.sqrt((sat1.x - sat2.x)**2 + (sat1.y - sat2.y)**2 + (sat1.z - sat2.z)**2)
+    if dist > 2500000:  # Range-based threshold: 2500 km maximum
+        return False
+        
+    # Earth-limb clearance constraint: 100 km minimum
+    R_E = 6371000
+    h_min = math.sqrt(max(0, ORBIT_RADIUS_M**2 - (dist/2)**2)) - R_E
+    if h_min < 100000:
+        return False
+        
     same_plane = (sat1.orbit_plane == sat2.orbit_plane)
-    cross_plane = (abs(sat1.orbit_plane - sat2.orbit_plane) == 1 and
+    cross_plane = (abs(sat1.orbit_plane - sat2.orbit_plane) in [1, NUM_ORBIT_PLANES - 1] and
                    sat1.slot == sat2.slot)
     return same_plane or cross_plane
 
@@ -306,7 +337,7 @@ class DDTScheduler(Scheduler):
         try:
             from stable_baselines3 import PPO
             self.fdt_model = PPO.load("ppo_fdt", device='cpu')
-            self.ldt_model = self.fdt_model  # distilled = same architecture
+            self.ldt_model = self.fdt_model  # In simulation, LDT uses same model; real deployment uses compressed GRU
             self.has_model = True
         except Exception:
             self.has_model = False
